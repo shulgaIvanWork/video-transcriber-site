@@ -1,0 +1,5 @@
+faster-whisper>=1.0,<2.0
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<1.0
+python-multipart>=0.0.9,<1
+aiofiles>=23,<24

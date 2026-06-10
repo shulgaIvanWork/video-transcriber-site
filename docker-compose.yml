@@ -1,0 +1,21 @@
+services:
+  web:
+    build: .
+    image: video-transcriber
+    container_name: transcriber
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./input:/app/input
+      - ./output:/app/output
+      - whisper-models:/root/.cache
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-base}
+      - WHISPER_LANG=${WHISPER_LANG:-ru}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - WHISPER_COMPUTE=${WHISPER_COMPUTE:-int8}
+    command: ["uvicorn", "upload-server:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+
+volumes:
+  whisper-models:
