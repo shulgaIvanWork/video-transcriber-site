@@ -2,40 +2,96 @@
 """
 upload-server.py — FastAPI сервер транскрибации видео → текст.
 
-Запуск:
-    uvicorn upload-server:app --host 0.0.0.0 --port 8080 --workers 1
+Файловая очередь (работает с несколькими Uvicorn worker'ами):
+  queue/pending/<id>.json   — задача ожидает
+  queue/active/<id>.json    — задача в обработке
+  queue/done/<id>.json      — задача выполнена
 
-Или внутри Docker:
-    docker run -p 8080:8080 video-transcriber
+Запуск:
+    uvicorn upload-server:app --host 0.0.0.0 --port 8080 --workers 2
 """
 
 import asyncio
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import urllib.parse
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 # ─── Конфиг ────────────────────────────────────────────────────────
 
 PROJECT_DIR = Path(__file__).parent
 INPUT_DIR = PROJECT_DIR / "input"
 OUTPUT_DIR = PROJECT_DIR / "output"
+QUEUE_DIR = PROJECT_DIR / "queue"
+PENDING_DIR = QUEUE_DIR / "pending"
+ACTIVE_DIR = QUEUE_DIR / "active"
+DONE_DIR = QUEUE_DIR / "done"
+
 PORT = int(os.environ.get("PORT", 8080))
 HOST = os.environ.get("HOST", "0.0.0.0")
 MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10 ГБ
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "1"))
 
 INPUT_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
+ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+DONE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─── Basic Auth ─────────────────────────────────────────────────────
+
+BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER", "admin")
+BASIC_AUTH_PASS = os.environ.get("BASIC_AUTH_PASS", "admin123")
+
+security = HTTPBasic(auto_error=False)
+
+
+def require_auth(credentials: HTTPBasicCredentials | None = Depends(security)):
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    if credentials.username != BASIC_AUTH_USER or credentials.password != BASIC_AUTH_PASS:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials
+
+# ─── Конфиг ────────────────────────────────────────────────────────
+
+PROJECT_DIR = Path(__file__).parent
+INPUT_DIR = PROJECT_DIR / "input"
+OUTPUT_DIR = PROJECT_DIR / "output"
+QUEUE_DIR = PROJECT_DIR / "queue"
+PENDING_DIR = QUEUE_DIR / "pending"
+ACTIVE_DIR = QUEUE_DIR / "active"
+DONE_DIR = QUEUE_DIR / "done"
+
+PORT = int(os.environ.get("PORT", 8080))
+HOST = os.environ.get("HOST", "0.0.0.0")
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024  # 10 ГБ
+
+INPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+PENDING_DIR.mkdir(parents=True, exist_ok=True)
+ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
+DONE_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="🎬 Video → Text Transcriber",
-    version="3.0",
+    version="3.1",
     docs_url=None,
     redoc_url=None,
 )
@@ -47,70 +103,166 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Очередь ────────────────────────────────────────────────────────
+# ─── Файловая очередь ───────────────────────────────────────────────
 
-class TranscriptionQueue:
-    """Простая очередь: один файл обрабатывается, остальные ждут."""
+def _job_id() -> str:
+    return uuid.uuid4().hex[:12]
 
-    def __init__(self, max_concurrent: int = 1):
-        self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._queue: list[str] = []
-        self._jobs: dict[str, dict] = {}
-        self._lock = asyncio.Lock()
+def _read_job(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
-    async def enqueue(self, filename: str) -> int:
-        async with self._lock:
-            self._queue.append(filename)
-            position = len(self._queue)
-            self._jobs[filename] = {
-                "status": "queued",
-                "position": position,
-                "started": None,
-            }
-            return position
+def _write_job(path: Path, data: dict):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    tmp.rename(path)
 
-    async def start_job(self, filename: str):
-        async with self._lock:
-            self._jobs[filename] = {
-                "status": "processing",
-                "started": time.time(),
-                "progress_file": str(OUTPUT_DIR / f"{Path(filename).stem}.progress.json"),
-            }
+def _list_jobs(dir_path: Path) -> list[Path]:
+    if not dir_path.is_dir():
+        return []
+    return sorted(dir_path.iterdir())
 
-    async def finish_job(self, filename: str, success: bool, error_msg: str = ""):
-        async with self._lock:
-            if success:
-                self._jobs[filename] = {"status": "done"}
-            else:
-                self._jobs[filename] = {"status": "error", "error": error_msg}
-            if filename in self._queue:
-                self._queue.remove(filename)
+def enqueue(filename: str) -> int:
+    """Добавляет задачу в очередь. Возвращает позицию."""
+    jid = _job_id()
+    data = {
+        "id": jid,
+        "filename": filename,
+        "status": "pending",
+        "created": time.time(),
+        "started": None,
+    }
+    _write_job(PENDING_DIR / f"{jid}.json", data)
+    # Позиция = количество задач в pending + active
+    return len(_list_jobs(PENDING_DIR)) + len(_list_jobs(ACTIVE_DIR))
 
-    async def get_job(self, filename: str) -> Optional[dict]:
-        async with self._lock:
-            job = self._jobs.get(filename)
-            if job is None:
-                return None
-            return dict(job)
+def claim_one() -> Optional[str]:
+    """Перемещает одну задачу из pending → active. Возвращает filename или None."""
+    for f in _list_jobs(PENDING_DIR):
+        data = _read_job(f)
+        if data is None:
+            continue
+        data["status"] = "active"
+        data["started"] = time.time()
+        dest = ACTIVE_DIR / f.name
+        # Атомарный перенос через файловую систему
+        try:
+            _write_job(dest, data)
+            f.unlink(missing_ok=True)
+            return data["filename"]
+        except Exception:
+            continue
+    return None
 
-    async def queue_size(self) -> int:
-        async with self._lock:
-            return len(self._queue)
+def finish_job(filename: str, success: bool, error_msg: str = ""):
+    """Перемещает active → done с результатом."""
+    for f in _list_jobs(ACTIVE_DIR):
+        data = _read_job(f)
+        if data and data.get("filename") == filename:
+            data["status"] = "done" if success else "error"
+            data["error"] = error_msg
+            data["finished"] = time.time()
+            dest = DONE_DIR / f.name
+            _write_job(dest, data)
+            f.unlink(missing_ok=True)
+            return
+
+def get_job_status(filename: str) -> Optional[dict]:
+    """Ищет задачу по имени файла во всех статусах."""
+    for d, status in [(PENDING_DIR, "queued"), (ACTIVE_DIR, "active"), (DONE_DIR, "done")]:
+        for f in _list_jobs(d):
+            data = _read_job(f)
+            if data and data.get("filename") == filename:
+                data["status"] = data.get("status", status)
+
+                # Считаем позицию в очереди
+                if data["status"] == "queued":
+                    pending = _list_jobs(PENDING_DIR)
+                    position = 1
+                    for pf in pending:
+                        pd = _read_job(pf)
+                        if pd and pd.get("id") == data.get("id"):
+                            break
+                        position += 1
+                    data["position"] = position
+
+                return data
+    return None
+
+def queue_stats() -> dict:
+    """Статистика очереди."""
+    pending = len(_list_jobs(PENDING_DIR))
+    active = len(_list_jobs(ACTIVE_DIR))
+    done_d = len(_list_jobs(DONE_DIR))
+    return {"pending": pending, "active": active, "done": done_d, "total": pending + active + done_d}
 
 
-queue = TranscriptionQueue(max_concurrent=MAX_CONCURRENT)
+# ─── Подхват файлов из input/ ──────────────────────────────────────
+
+def pickup_input_files():
+    """Сканирует input/ и ставит новые файлы в очередь.
+    Чистит stale active/ и error done/ задачи (воркер мог упасть с OOM)."""
+    count = 0
+
+    # Stale active → возвращаем в pending + сразу запускаем обработку
+    for f in _list_jobs(ACTIVE_DIR):
+        data = _read_job(f)
+        if data:
+            fname = data.get("filename", "")
+            # Если файл есть в input — оставляем в active и сразу запускаем
+            if (INPUT_DIR / fname).exists() and not (OUTPUT_DIR / f"{Path(fname).stem}.txt").exists():
+                print(f"🔄  Stale active, запускаю: {fname}")
+                asyncio.create_task(process_file(fname))
+                count += 1
+                continue
+            # Иначе — в pending
+            data["status"] = "pending"
+            data["started"] = None
+            data.pop("error", None)
+            dest = PENDING_DIR / f.name
+            _write_job(dest, data)
+            f.unlink(missing_ok=True)
+            print(f"🔄  Stale active → pending: {fname}")
+            count += 1
+
+    # Error done → удаляем маркер (файл перейдёт в pending ниже)
+    for f in _list_jobs(DONE_DIR):
+        data = _read_job(f)
+        if data and data.get("status") == "error":
+            fname = data.get("filename", "")
+            f.unlink(missing_ok=True)
+            print(f"🗑️  Removed error marker: {fname}")
+
+    for f in sorted(INPUT_DIR.iterdir()):
+        if not f.is_file():
+            continue
+        stem = f.stem
+        # Пропускаем, если уже в очереди или готов
+        if get_job_status(f.name) is not None:
+            continue
+        if (OUTPUT_DIR / f"{stem}.txt").exists():
+            continue
+        enqueue(f.name)
+        print(f"↩  Pickup from input: {f.name}")
+        count += 1
+    return count
 
 
 # ─── Фоновый воркер ────────────────────────────────────────────────
 
 async def process_file(filename: str):
-    """Запускает транскрибацию в подпроцессе и следит за результатом."""
+    """Запускает транскрибацию в подпроцессе."""
     stem = Path(filename).stem
     progress_file = OUTPUT_DIR / f"{stem}.progress.json"
     input_path = INPUT_DIR / filename
-    output_files = [OUTPUT_DIR / f"{stem}.txt"]
+    output_txt = OUTPUT_DIR / f"{stem}.txt"
 
-    await queue.start_job(filename)
+    if not input_path.exists():
+        finish_job(filename, False, "Файл не найден в input/")
+        return
+
     print(f"\n🎯  Старт: {filename}")
 
     cmd = [
@@ -132,81 +284,60 @@ async def process_file(filename: str):
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=86400)
 
         if proc.returncode == 0:
-            # Проверяем, что хотя бы один выходной файл создан
-            any_output = any(p.exists() for p in output_files)
-            if any_output:
-                await queue.finish_job(filename, success=True)
+            if output_txt.exists():
+                finish_job(filename, success=True)
                 print(f"✅  Готово: {filename}")
-
-                # Чистим input после успешной обработки
+                # Чистим input
                 try:
                     input_path.unlink(missing_ok=True)
-                    print(f"🧹  Input удалён: {filename}")
-                except Exception as e:
-                    print(f"⚠️  Не удалось удалить {filename}: {e}")
-
-                # Чистим progress-файл (если остался)
+                except Exception:
+                    pass
+                # Чистим progress
                 try:
                     progress_file.unlink(missing_ok=True)
                 except Exception:
                     pass
             else:
-                err = "Файлы результата не найдены"
-                await queue.finish_job(filename, success=False, error_msg=err)
+                err = "Файл результата не найден"
+                finish_job(filename, False, err)
                 print(f"❌  {err}: {filename}")
         else:
             err_text = stderr.decode("utf-8", errors="replace")[-500:] if stderr else ""
             if not err_text:
-                err_text = stdout.decode("utf-8", errors="replace")[-500:] if stdout else "Ошибка транскрибации"
-            await queue.finish_job(filename, success=False, error_msg=err_text)
+                err_text = stdout.decode("utf-8", errors="replace")[-500:] if stdout else "Неизвестная ошибка"
+            finish_job(filename, False, err_text)
             print(f"❌  Ошибка ({proc.returncode}): {err_text[:200]}")
 
     except asyncio.TimeoutError:
-        await queue.finish_job(filename, success=False, error_msg="Таймаут (>24ч)")
+        finish_job(filename, False, "Таймаут (>24ч)")
         print(f"❌  Таймаут: {filename}")
     except Exception as e:
-        await queue.finish_job(filename, success=False, error_msg=str(e))
+        finish_job(filename, False, str(e))
         print(f"❌  {e}")
 
 
 async def worker_loop():
-    """Фоновый цикл: берёт задачи из очереди и обрабатывает."""
+    """Фоновый цикл: забирает задачи из очереди и обрабатывает."""
     while True:
-        filename = None
-        async with queue._lock:
-            if queue._queue:
-                # Берём первый файл, который ещё не в processing
-                for f in queue._queue:
-                    job = queue._jobs.get(f, {})
-                    if job.get("status") == "queued":
-                        filename = f
-                        break
-
+        filename = claim_one()
         if filename:
             await process_file(filename)
         else:
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
 
 @app.on_event("startup")
 async def startup():
-    # Стартуем фоновый воркер
+    # Подхватываем файлы из input/ + чистим stale
+    n = pickup_input_files()
+    if n:
+        print(f"📦  Подхвачено из input/: {n} файл(ов)")
+
+    # Стартуем фоновый воркер — оба воркера крутят цикл,
+    # но claim_one() атомарен (temp+rename), только один возьмёт задачу
     asyncio.create_task(worker_loop())
 
-    # Подхватываем файлы, которые могли остаться в input после перезапуска
-    existing = [f.name for f in sorted(INPUT_DIR.iterdir()) if f.is_file()]
-    new_count = 0
-    for fname in existing:
-        stem = Path(fname).stem
-        # Если нет результата — ставим в очередь
-        if not (OUTPUT_DIR / f"{stem}.txt").exists():
-            await queue.enqueue(fname)
-            print(f"↩  Подхвачен из input: {fname}")
-            new_count += 1
-
-    print(f"🎬  Сервер запущен: http://localhost:{PORT}")
-    if new_count:
-        print(f"📦  Добавлено в очередь: {new_count} файл(ов) из input/")
+    print(f"🎬  Сервер запущен (PID {os.getpid()}): http://localhost:{PORT}")
 
 
 # ─── Вспомогательные функции ────────────────────────────────────────
@@ -225,12 +356,13 @@ SUPPORTED_EXTENSIONS = {
 # ─── Служебные ручки ──────────────────────────────────────────────
 
 @app.get("/health")
-async def health():
-    return {"status": "ok", "queue": await queue.queue_size()}
+async def health(_auth=Depends(require_auth)):
+    stats = queue_stats()
+    return {"status": "ok", "queue": stats}
 
 
 @app.get("/files")
-async def list_files():
+async def list_files(_auth=Depends(require_auth)):
     """Список готовых .txt файлов для скачивания."""
     files = []
     for p in sorted(OUTPUT_DIR.iterdir()):
@@ -241,6 +373,30 @@ async def list_files():
                 "name": p.name,
                 "size_kb": size_kb,
                 "modified": mtime,
+            })
+    return {"files": files}
+
+
+@app.get("/uploaded")
+async def list_uploaded(_auth=Depends(require_auth)):
+    """Список загруженных видео (файлы в input/)."""
+    files = []
+    for p in sorted(INPUT_DIR.iterdir()):
+        if p.is_file():
+            size_mb = round(p.stat().st_size / (1024 * 1024), 1)
+            mtime = p.stat().st_mtime
+            # Статус в очереди
+            qs = ""
+            for d, label in [(PENDING_DIR, "⏳"), (ACTIVE_DIR, "⚙️"), (DONE_DIR, "✅")]:
+                for f in _list_jobs(d):
+                    data = _read_job(f)
+                    if data and data.get("filename") == p.name:
+                        qs = label
+            files.append({
+                "name": p.name,
+                "size_mb": size_mb,
+                "modified": mtime,
+                "queue_status": qs,
             })
     return {"files": files}
 
@@ -316,6 +472,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .files-list .file-row .finfo{font-size:12px;color:#94a3b8;margin:0 12px;white-space:nowrap}
   .files-list .file-row .fdl{font-size:13px;color:#6366f1;text-decoration:none;font-weight:600;white-space:nowrap}
   .files-list .file-row .fdl:hover{color:#4f46e5;text-decoration:underline}
+  .files-list .file-row .fstatus{font-size:11px;color:#64748b;white-space:nowrap;margin-right:8px}
+  .btn-del{background:none;border:none;cursor:pointer;font-size:14px;padding:4px;opacity:.6;transition:.15s;line-height:1}
+  .btn-del:hover{opacity:1}
   .files-empty{text-align:center;padding:20px;color:#94a3b8;font-size:13px}
 </style>
 </head>
@@ -330,6 +489,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <div class="dropzone-hint">MP4, MKV, MOV, AVI, WAV, MP3 · до 10 ГБ</div>
   </div>
   <input type="file" id="fileInput" accept="video/*,audio/*">
+
+  <!-- Список загруженных видео -->
+  <div class="files-list" style="margin-top:12px">
+    <details>
+      <summary>🎬 Загруженные видео <span class="queue-badge" id="uploadedCount">0</span></summary>
+      <div id="uploadedBody">
+        <div class="files-empty">Нет загруженных файлов</div>
+      </div>
+    </details>
+  </div>
 
   <!-- Список готовых файлов -->
   <div class="files-list" id="filesList">
@@ -394,6 +563,17 @@ const queueText = document.getElementById('queueText');
 const actions = document.getElementById('actions');
 const fileSection = document.getElementById('fileSection');
 
+// Basic Auth — добавляем заголовок ко всем fetch
+const AUTH = 'Basic ' + btoa('admin:admin123');
+const authHeaders = { 'Authorization': AUTH };
+
+function authFetch(url, opts) {
+  opts = opts || {};
+  opts.headers = opts.headers || {};
+  Object.assign(opts.headers, authHeaders);
+  return fetch(url, opts);
+}
+
 let currentFilename = null;
 let pollTimer = null;
 
@@ -438,6 +618,7 @@ async function handleFiles(files) {
       };
       xhr.onerror = () => reject(new Error('Network error'));
       xhr.open('POST', '/upload');
+      xhr.setRequestHeader('Authorization', AUTH);
       xhr.send(formData);
     });
 
@@ -467,7 +648,7 @@ function startPolling(filename) {
 
   pollTimer = setInterval(async () => {
     try {
-      const resp = await fetch('/status?file=' + encodeURIComponent(filename));
+      const resp = await authFetch('/status?file=' + encodeURIComponent(filename));
       const data = await resp.json();
 
       if (data.status === 'queued') {
@@ -537,7 +718,7 @@ function loadPartialPreview(filename) {
   const body = document.getElementById('previewBody');
   const info = document.getElementById('previewInfo');
 
-  fetch('/preview?file=' + encodeURIComponent(filename))
+  authFetch('/preview?file=' + encodeURIComponent(filename))
     .then(r => {
       if (!r.ok) throw new Error('no preview');
       return r.text();
@@ -560,9 +741,10 @@ function loadPartialPreview(filename) {
 
 function showDownload(filename) {
   const stem = filename.replace(/\.[^.]+$/, '');
+  const encodedName = encodeURIComponent(stem + '.txt');
   actions.innerHTML = `
     <div class="flex">
-      <a class="btn btn-primary" href="/download/${stem}.txt" download>📄 Скачать текст (.txt)</a>
+      <a class="btn btn-primary" href="/download/${encodedName}" download>📄 Скачать текст (.txt)</a>
     </div>
   `;
 }
@@ -588,7 +770,7 @@ function formatSize(bytes) {
 // ── Список готовых файлов ──
 
 function loadFilesList() {
-  fetch('/files')
+  authFetch('/files')
     .then(r => r.json())
     .then(data => {
       const body = document.getElementById('filesBody');
@@ -598,7 +780,7 @@ function loadFilesList() {
       count.textContent = files.length;
 
       if (!files.length) {
-        body.innerHTML = '<div class="files-empty">Пока нет готовых расшифровок</div>';
+        body.innerHTML = '<div class="files-empty">Нет готовых файлов</div>';
         return;
       }
 
@@ -610,18 +792,146 @@ function loadFilesList() {
         const sizeStr = f.size_kb < 1024
           ? f.size_kb + ' КБ'
           : (f.size_kb / 1024).toFixed(1) + ' МБ';
+        const encoded = encodeURIComponent(f.name);
         return `<div class="file-row">
           <span class="fname">📄 ${escHtml(f.name)}</span>
           <span class="finfo">${sizeStr} · ${dateStr}</span>
-          <a class="fdl" href="/download/${encodeURIComponent(f.name)}" download>Скачать</a>
+          <a class="fdl" href="/download/${encoded}" download>📥</a>
+          <button class="btn-del" onclick="deleteFile('${encoded}', 'output')" title="Удалить">🗑️</button>
         </div>`;
       }).join('');
     })
     .catch(() => {});
 }
 
-// Загружаем список при старте и после завершения задачи
+// ── Удаление файлов ──
+
+function deleteFile(encoded, source) {
+  const name = decodeURIComponent(encoded);
+  if (!confirm('Удалить «' + name + '»?')) return;
+
+  authFetch('/delete/' + encoded, { method: 'DELETE' })
+    .then(r => {
+      if (!r.ok) throw new Error('Ошибка удаления');
+      return r.json();
+    })
+    .then(data => {
+      loadFilesList();
+      loadUploadedFiles();
+      // Если удалили активный файл — сбрасываем интерфейс
+      if (currentFilename === name) {
+        if (pollTimer) clearInterval(pollTimer);
+        currentFilename = null;
+        setStatus('idle', '💡 Файл удалён');
+        actions.innerHTML = '';
+        uploadProgress.style.display = 'none';
+      }
+      setStatus('idle', '🗑️ Файл удалён');
+    })
+    .catch(err => {
+      alert('Ошибка: ' + err.message);
+    });
+}
+
+// ── Список загруженных видео ──
+
+function loadUploadedFiles() {
+  authFetch('/uploaded')
+    .then(r => r.json())
+    .then(data => {
+      const body = document.getElementById('uploadedBody');
+      const count = document.getElementById('uploadedCount');
+      const files = data.files || [];
+      count.textContent = files.length;
+      if (!files.length) {
+        body.innerHTML = '<div class="files-empty">Нет загруженных файлов</div>';
+        return;
+      }
+      body.innerHTML = files.map(f => {
+        const date = new Date(f.modified * 1000);
+        const dateStr = date.toLocaleDateString('ru-RU', {
+          day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit'
+        });
+        const sizeStr = f.size_mb < 1
+          ? Math.round(f.size_mb * 1024) + ' КБ'
+          : f.size_mb.toFixed(1) + ' МБ';
+        const encoded = encodeURIComponent(f.name);
+        return `<div class="file-row">
+          <span class="fname">🎬 ${escHtml(f.name)}</span>
+          <span class="finfo">${sizeStr} · ${dateStr}</span>
+          <span class="fstatus">${f.queue_status}</span>
+          <button class="btn-del" onclick="deleteFile('${encoded}', 'input')" title="Удалить">🗑️</button>
+        </div>`;
+      }).join('');
+    })
+    .catch(() => {});
+}
+
+// ── Проверка активной задачи при загрузке страницы ──
+
+function checkActiveJob() {
+  authFetch('/status')
+    .then(r => r.json())
+    .then(data => {
+      if (data.active_file) {
+        currentFilename = data.active_file;
+        fileName.textContent = currentFilename;
+        fileSection.classList.add('show');
+
+        if (data.status === 'queued') {
+          setStatus('idle', '⏳ В очереди: ' + currentFilename);
+          queueMsg.style.display = 'block';
+          queueText.textContent = 'Позиция в очереди: ' + (data.position || 1);
+        } else if (data.status === 'processing' || data.status === 'loading_model') {
+          dropzone.classList.add('has-file');
+
+          // Определяем примерный размер файла из имени
+          authFetch('/files').then(r => r.json()).then(fd => {
+            const match = fd.files.find(f => f.name.startsWith(currentFilename.replace(/\.[^.]+$/, '')));
+            if (match) fileSize.textContent = match.size_kb >= 1024
+              ? (match.size_kb/1024).toFixed(1) + ' МБ'
+              : match.size_kb + ' КБ';
+          }).catch(()=>{});
+
+          // Восстанавливаем состояние из ответа напрямую
+          if (data.progress_pct > 0) {
+            const pct = Math.round(data.progress_pct);
+            uploadFill.style.width = Math.min(pct, 100) + '%';
+            uploadProgress.style.display = 'block';
+            const elapsed = data.elapsed_sec || 0;
+            const elapsedStr = elapsed >= 3600
+              ? (elapsed/3600).toFixed(1) + ' ч'
+              : Math.round(elapsed/60) + ' мин';
+            let html = `<span class="spinner"></span> ${pct}% · ${elapsedStr}`;
+            if (data.chunk) html += `<br><span style="font-size:12px;color:#6366f1">Чанк ${data.chunk}</span>`;
+            if (data.segments_count) {
+              html += `<br><span style="font-size:12px;color:#6366f1">${data.segments_count} фрагментов · «${escHtml((data.last_text||'').slice(0,60))}»</span>`;
+            }
+            setStatus('processing', html);
+            if (data.has_partial) {
+              loadPartialPreview(currentFilename);
+            }
+          } else {
+            setStatus('processing', '<span class="spinner"></span> Загрузка модели… (' + (data.elapsed_sec||0) + ' сек)');
+          }
+
+          startPolling(currentFilename);
+        } else if (data.status === 'done') {
+          setStatus('done', '✅ Готово: ' + currentFilename);
+          showDownload(currentFilename);
+          loadFilesList();
+        } else if (data.status === 'error') {
+          setStatus('error', '❌ ' + (data.error || 'Ошибка'));
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+// При загрузке страницы — проверяем активную задачу и список файлов
+checkActiveJob();
 loadFilesList();
+loadUploadedFiles();
 </script>
 </body>
 </html>
@@ -629,14 +939,14 @@ loadFilesList();
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(_auth=Depends(require_auth)):
     return INDEX_HTML
 
 
 # ─── Upload ─────────────────────────────────────────────────────────
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), _auth=Depends(require_auth)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Файл не выбран")
 
@@ -664,21 +974,21 @@ async def upload_file(file: UploadFile = File(...)):
     # Пишем файл чанками (чтобы не грузить весь в память)
     with open(dest, "wb") as f:
         while True:
-            chunk = await file.read(64 * 1024)  # 64KB чанки
+            chunk = await file.read(64 * 1024)
             if not chunk:
                 break
             f.write(chunk)
 
-    # Ставим в очередь
-    position = await queue.enqueue(dest.name)
+    # Ставим в очередь (файловая очередь, не блокирует event loop)
+    position = enqueue(dest.name)
 
-    print(f"📥  Загружен: {dest.name} ({dest.stat().st_size / 1024 / 1024:.0f} МБ), "
-          f"позиция в очереди: {position}")
+    size_mb = round(dest.stat().st_size / (1024 * 1024), 1)
+    print(f"📥  Загружен: {dest.name} ({size_mb} МБ), позиция: {position}")
 
     return {
         "ok": True,
         "name": dest.name,
-        "size_mb": round(dest.stat().st_size / (1024 * 1024), 1),
+        "size_mb": size_mb,
         "position": position,
     }
 
@@ -686,14 +996,35 @@ async def upload_file(file: UploadFile = File(...)):
 # ─── Status ─────────────────────────────────────────────────────────
 
 @app.get("/status")
-async def get_status(file: str):
-    """Статус обработки файла."""
-    stem = get_stem(file)
+async def get_status(file: Optional[str] = None, _auth=Depends(require_auth)):
+    """Статус обработки файла. Если file не указан — отдаёт активный."""
+    if file:
+        return _get_file_status(file)
 
-    # Сначала проверяем очередь
-    job = await queue.get_job(file)
+    # Без file — отдаём текущий статус очереди
+    active_files = _list_jobs(ACTIVE_DIR)
+    if active_files:
+        data = _read_job(active_files[0])
+        if data:
+            fname = data.get("filename", "")
+            result = _get_file_status(fname)
+            result["active_file"] = fname
+            return result
+
+    pending_files = _list_jobs(PENDING_DIR)
+    if pending_files:
+        data = _read_job(pending_files[0])
+        if data:
+            return {"status": "queued", "active_file": data.get("filename", ""), "position": 1}
+
+    return {"status": "idle"}
+
+
+def _get_file_status(file: str) -> dict:
+    """Статус для конкретного файла."""
+    stem = Path(file).stem
+    job = get_job_status(file)
     if job is None:
-        # Возможно файл уже готов (принесли в input вручную)
         txt = OUTPUT_DIR / f"{stem}.txt"
         if txt.exists():
             return {"status": "done", "txt": f"{stem}.txt"}
@@ -703,36 +1034,36 @@ async def get_status(file: str):
         return {
             "status": "queued",
             "position": job.get("position", 0),
+            "filename": file,
         }
 
-    if job["status"] == "processing":
+    if job["status"] == "active":
         elapsed = time.time() - (job.get("started") or time.time())
+        progress_file = OUTPUT_DIR / f"{stem}.progress.json"
 
-        # Читаем прогресс из файла
-        pf = job.get("progress_file")
         progress_data = {}
-        if pf and os.path.isfile(pf):
+        if progress_file.exists():
             try:
-                with open(pf, "r", encoding="utf-8") as f:
-                    progress_data = json.load(f)
+                progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
             except Exception:
                 pass
 
         pct = progress_data.get("progress_pct", 0)
-        processed_sec = progress_data.get("processed_sec", 0)
-        total_sec = progress_data.get("total_duration_sec", 0)
         seg_count = progress_data.get("segments_count", 0)
         last_text = progress_data.get("text", "")
+        chunk = progress_data.get("chunk", "")
+        total_dur = progress_data.get("total_duration_sec", 0)
 
         return {
-            "status": "processing",
+            "status": "processing" if pct > 0 else "loading_model",
+            "filename": file,
             "progress_pct": round(pct, 1),
-            "processed_sec": processed_sec,
-            "total_duration_sec": total_sec,
             "segments_count": seg_count,
             "last_text": last_text[:200] if last_text else "",
             "elapsed_sec": round(elapsed, 1),
-            "has_partial": os.path.isfile(OUTPUT_DIR / f"{stem}.partial.txt"),
+            "chunk": chunk,
+            "total_duration_sec": round(total_dur, 1),
+            "has_partial": (OUTPUT_DIR / f"{stem}.partial.txt").exists(),
         }
 
     if job["status"] == "done":
@@ -740,20 +1071,24 @@ async def get_status(file: str):
         txt_p = OUTPUT_DIR / f"{stem}.txt"
         if txt_p.exists():
             size_kb = round(txt_p.stat().st_size / 1024, 1)
-        return {"status": "done", "txt": f"{stem}.txt", "size_kb": size_kb}
+        return {"status": "done", "filename": file, "txt": f"{stem}.txt", "size_kb": size_kb}
 
-    return {
-        "status": "error",
-        "error": job.get("error", "Неизвестная ошибка"),
-    }
+    if job.get("status") in ("error",):
+        return {
+            "status": "error",
+            "filename": file,
+            "error": job.get("error", "Неизвестная ошибка"),
+        }
+
+    return {"status": "idle"}
 
 
 # ─── Preview ───────────────────────────────────────────────────────
 
 @app.get("/preview")
-async def get_preview(file: str):
+async def get_preview(file: str, _auth=Depends(require_auth)):
     """Частичный текст в процессе обработки."""
-    stem = get_stem(file)
+    stem = Path(file).stem
     partial_path = OUTPUT_DIR / f"{stem}.partial.txt"
     if not partial_path.exists():
         raise HTTPException(status_code=404, detail="partial text not available yet")
@@ -767,9 +1102,8 @@ async def get_preview(file: str):
 # ─── Download ───────────────────────────────────────────────────────
 
 @app.get("/download/{filename:path}")
-async def download_file(filename: str):
+async def download_file(filename: str, _auth=Depends(require_auth)):
     """Скачать готовый файл."""
-    # security: не даём выйти за output/
     filepath = (OUTPUT_DIR / filename).resolve()
     if not str(filepath).startswith(str(OUTPUT_DIR.resolve())):
         raise HTTPException(status_code=403, detail="forbidden")
@@ -777,17 +1111,62 @@ async def download_file(filename: str):
     if not filepath.exists() or not filepath.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
-    mime_map = {
-        ".txt": "text/plain; charset=utf-8",
-    }
+    mime_map = {".txt": "text/plain; charset=utf-8"}
     content_type = mime_map.get(filepath.suffix, "application/octet-stream")
 
     data = filepath.read_bytes()
+    safe_name = filepath.name.encode("ascii", errors="replace").decode("ascii")
+
+    # RFC 5987 — поддержка кириллицы в имени файла
+    try:
+        filepath.name.encode("ascii")
+        disposition = f'attachment; filename="{filepath.name}"'
+    except UnicodeEncodeError:
+        disposition = (
+            f'attachment; filename="{safe_name}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filepath.name)}"
+        )
+
     return Response(
         content=data,
         media_type=content_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{filepath.name}"',
+            "Content-Disposition": disposition,
             "Content-Length": str(len(data)),
         },
     )
+
+
+# ─── Delete ─────────────────────────────────────────────────────────
+
+
+@app.delete("/delete/{filename:path}")
+async def delete_file(filename: str, _auth=Depends(require_auth)):
+    """Удаляет файл из input/ или output/."""
+    stem = Path(filename).stem
+
+    # Удаляем из input/
+    input_file = (INPUT_DIR / filename).resolve()
+    if str(input_file).startswith(str(INPUT_DIR.resolve())) and input_file.exists():
+        input_file.unlink()
+        # Удаляем маркер очереди
+        for d in [PENDING_DIR, ACTIVE_DIR, DONE_DIR]:
+            for f in _list_jobs(d):
+                data = _read_job(f)
+                if data and data.get("filename") == filename:
+                    f.unlink(missing_ok=True)
+        print(f"🗑️  Удалён input: {filename}")
+
+    # Удаляем из output/
+    deleted_output = []
+    for suffix in [".txt", ".partial.txt", ".json", ".progress.json"]:
+        p = (OUTPUT_DIR / f"{stem}{suffix}").resolve()
+        if str(p).startswith(str(OUTPUT_DIR.resolve())) and p.exists():
+            p.unlink()
+            deleted_output.append(p.name)
+
+    if deleted_output:
+        print(f"🗑️  Удалено из output: {', '.join(deleted_output)}")
+
+    return {"ok": True, "deleted_input": filename if input_file.exists() is False else None,
+            "deleted_output": deleted_output}
