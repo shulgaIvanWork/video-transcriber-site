@@ -1,0 +1,36 @@
+# Input files — временные, удаляются после обработки
+input/*.mp4
+input/*.mkv
+input/*.avi
+input/*.mov
+input/*.webm
+input/*.m4v
+input/*.ts
+input/*.flv
+input/*.wmv
+input/*.3gp
+input/*.mpg
+input/*.mpeg
+input/*.wav
+input/*.mp3
+input/*.m4a
+input/*.ogg
+input/*.flac
+input/*.aac
+input/*.wma
+input/*.opus
+input/*.aiff
+
+# Output — результаты транскрибации (не в git)
+output/*.txt
+output/*.json
+
+# Queue markers
+queue/
+
+# Docker volume models
+whisper-models/
+
+# Python
+__pycache__/
+*.pyc
